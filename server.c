@@ -47,6 +47,8 @@ typedef struct {
 
 int server_fd;
 
+pthread_mutex_t enrollment_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void sendToClient(int client_fd, const char *msg) {
     write(client_fd, msg, strlen(msg));
 }
@@ -82,12 +84,11 @@ void unlockFile(int fd) {
     fcntl(fd, F_SETLK, &lock);
 }
 
-char* authenticate(const char *username, const char *password, int *user_id) {
-    static char role[20];
+int authenticate(const char *username, const char *password, int *user_id, char *role) {
     int fd;
 
     fd = open(FACULTY_FILE, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0) return 0;
 
     lockFile(fd, F_RDLCK);
     Faculty fac;
@@ -97,14 +98,14 @@ char* authenticate(const char *username, const char *password, int *user_id) {
             close(fd);
             strcpy(role, "admin");
             *user_id = 0;
-            return role;
+            return 1;
         }
     }
     unlockFile(fd);
     close(fd);
 
     fd = open(STUDENTS_FILE, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0) return 0;
 
     lockFile(fd, F_RDLCK);
     Student stu;
@@ -115,13 +116,13 @@ char* authenticate(const char *username, const char *password, int *user_id) {
                 close(fd);
                 strcpy(role, "student");
                 *user_id = stu.id;
-                return role;
+                return 1;
             } else {
                 unlockFile(fd);
                 close(fd);
                 strcpy(role, "inactive");
                 *user_id = stu.id;
-                return role;
+                return 1;
             }
         }
     }
@@ -129,7 +130,7 @@ char* authenticate(const char *username, const char *password, int *user_id) {
     close(fd);
 
     fd = open(FACULTY_FILE, O_RDONLY);
-    if (fd < 0) return NULL;
+    if (fd < 0) return 0;
 
     lockFile(fd, F_RDLCK);
     while (read(fd, &fac, sizeof(Faculty)) == sizeof(Faculty)) {
@@ -138,13 +139,13 @@ char* authenticate(const char *username, const char *password, int *user_id) {
             close(fd);
             strcpy(role, "faculty");
             *user_id = fac.id;
-            return role;
+            return 1;
         }
     }
     unlockFile(fd);
     close(fd);
 
-    return NULL;
+    return 0;
 }
 
 void handleAddStudent(int client_fd) {
@@ -159,10 +160,12 @@ void handleAddStudent(int client_fd) {
     sendToClient(client_fd, "Enter Student Name: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(stu.name, buffer, sizeof(stu.name)-1);
+    stu.name[sizeof(stu.name) - 1] = '\0';
 
     sendToClient(client_fd, "Enter Password: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(stu.password, buffer, sizeof(stu.password)-1);
+    stu.password[sizeof(stu.password) - 1] = '\0';
 
     stu.active = 1;
 
@@ -189,7 +192,12 @@ void handleAddStudent(int client_fd) {
     }
 
     lockFile(fd, F_WRLCK);
-    write(fd, &stu, sizeof(Student));
+    if (write(fd, &stu, sizeof(Student)) != sizeof(Student)) {
+        unlockFile(fd);
+        close(fd);
+        sendToClient(client_fd, "Error: Failed to add student record.\n");
+        return;
+    }
     unlockFile(fd);
     close(fd);
 
@@ -208,10 +216,12 @@ void handleAddFaculty(int client_fd) {
     sendToClient(client_fd, "Enter Faculty Name: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(fac.name, buffer, sizeof(fac.name)-1);
+    fac.name[sizeof(fac.name) - 1] = '\0';
 
     sendToClient(client_fd, "Enter Password: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(fac.password, buffer, sizeof(fac.password)-1);
+    fac.password[sizeof(fac.password) - 1] = '\0';
 
     fd = open(FACULTY_FILE, O_RDONLY);
     if (fd >= 0) {
@@ -236,7 +246,12 @@ void handleAddFaculty(int client_fd) {
     }
 
     lockFile(fd, F_WRLCK);
-    write(fd, &fac, sizeof(Faculty));
+    if (write(fd, &fac, sizeof(Faculty)) != sizeof(Faculty)) {
+        unlockFile(fd);
+        close(fd);
+        sendToClient(client_fd, "Error: Failed to add faculty record.\n");
+        return;
+    }
     unlockFile(fd);
     close(fd);
 
@@ -268,8 +283,14 @@ void handleActivateDeactivate(int client_fd) {
     while (read(fd, &stu, sizeof(Student)) == sizeof(Student)) {
         if (stu.id == student_id) {
             stu.active = action;
-            lseek(fd, -(off_t)sizeof(Student), SEEK_CUR);
-            write(fd, &stu, sizeof(Student));
+            if (lseek(fd, -(off_t)sizeof(Student), SEEK_CUR) == (off_t)-1) {
+                perror("lseek failed");
+                break;
+            }
+            if (write(fd, &stu, sizeof(Student)) != sizeof(Student)) {
+                perror("Failed to update student");
+                break;
+            }
             found = 1;
             break;
         }
@@ -309,16 +330,24 @@ void handleUpdateStudent(int client_fd) {
             readFromClient(client_fd, buffer, BUFFER_SIZE);
             if (strlen(buffer) > 0) {
                 strncpy(stu.name, buffer, sizeof(stu.name)-1);
+                stu.name[sizeof(stu.name) - 1] = '\0';
             }
 
             sendToClient(client_fd, "Enter new Password (or press Enter to skip): ");
             readFromClient(client_fd, buffer, BUFFER_SIZE);
             if (strlen(buffer) > 0) {
                 strncpy(stu.password, buffer, sizeof(stu.password)-1);
+                stu.password[sizeof(stu.password) - 1] = '\0';
             }
 
-            lseek(fd, -(off_t)sizeof(Student), SEEK_CUR);
-            write(fd, &stu, sizeof(Student));
+            if (lseek(fd, -(off_t)sizeof(Student), SEEK_CUR) == (off_t)-1) {
+                perror("lseek failed");
+                break;
+            }
+            if (write(fd, &stu, sizeof(Student)) != sizeof(Student)) {
+                perror("Failed to update student");
+                break;
+            }
             found = 1;
             break;
         }
@@ -358,16 +387,24 @@ void handleUpdateFaculty(int client_fd) {
             readFromClient(client_fd, buffer, BUFFER_SIZE);
             if (strlen(buffer) > 0) {
                 strncpy(fac.name, buffer, sizeof(fac.name)-1);
+                fac.name[sizeof(fac.name) - 1] = '\0';
             }
 
             sendToClient(client_fd, "Enter new Password (or press Enter to skip): ");
             readFromClient(client_fd, buffer, BUFFER_SIZE);
             if (strlen(buffer) > 0) {
                 strncpy(fac.password, buffer, sizeof(fac.password)-1);
+                fac.password[sizeof(fac.password) - 1] = '\0';
             }
 
-            lseek(fd, -(off_t)sizeof(Faculty), SEEK_CUR);
-            write(fd, &fac, sizeof(Faculty));
+            if (lseek(fd, -(off_t)sizeof(Faculty), SEEK_CUR) == (off_t)-1) {
+                perror("lseek failed");
+                break;
+            }
+            if (write(fd, &fac, sizeof(Faculty)) != sizeof(Faculty)) {
+                perror("Failed to update faculty");
+                break;
+            }
             found = 1;
             break;
         }
@@ -396,15 +433,20 @@ void handleEnrollCourse(int client_fd, int student_id) {
 
     lockFile(fd, F_RDLCK);
     Course course;
-    char response[4096] = "\n=== Available Courses ===\n";
-    char temp[256];
+    char response[4096];
     int count = 0;
+    size_t used = 0;
+
+    used += snprintf(response + used, sizeof(response) - used,
+                     "\n=== Available Courses ===\n");
 
     while (read(fd, &course, sizeof(Course)) == sizeof(Course)) {
         if (course.active) {
-            snprintf(temp, sizeof(temp), "ID: %d | Name: %s | Seats: %d\n",
-                    course.id, course.name, course.max_seats);
-            strcat(response, temp);
+            if (used < sizeof(response)) {
+                used += snprintf(response + used, sizeof(response) - used,
+                                 "ID: %d | Name: %s | Seats: %d\n",
+                                 course.id, course.name, course.max_seats);
+            }
             count++;
         }
     }
@@ -416,12 +458,17 @@ void handleEnrollCourse(int client_fd, int student_id) {
         return;
     }
 
-    strcat(response, "=========================\n");
+    if (used < sizeof(response)) {
+        used += snprintf(response + used, sizeof(response) - used,
+                         "=========================\n");
+    }
     sendToClient(client_fd, response);
 
     sendToClient(client_fd, "Enter Course ID to enroll: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     course_id = atoi(buffer);
+
+    pthread_mutex_lock(&enrollment_mutex);
 
     fd = open(ENROLLMENTS_FILE, O_RDONLY);
     if (fd >= 0) {
@@ -431,6 +478,7 @@ void handleEnrollCourse(int client_fd, int student_id) {
             if (en.student_id == student_id && en.course_id == course_id) {
                 unlockFile(fd);
                 close(fd);
+                pthread_mutex_unlock(&enrollment_mutex);
                 sendToClient(client_fd, "Error: Already enrolled in this course.\n");
                 return;
             }
@@ -441,6 +489,7 @@ void handleEnrollCourse(int client_fd, int student_id) {
 
     fd = open(COURSES_FILE, O_RDWR);
     if (fd < 0) {
+        pthread_mutex_unlock(&enrollment_mutex);
         sendToClient(client_fd, "Error: Could not open courses file.\n");
         return;
     }
@@ -454,13 +503,26 @@ void handleEnrollCourse(int client_fd, int student_id) {
             if (targetCourse.max_seats <= 0) {
                 unlockFile(fd);
                 close(fd);
+                pthread_mutex_unlock(&enrollment_mutex);
                 sendToClient(client_fd, "Error: No seats available in this course.\n");
                 return;
             }
 
             targetCourse.max_seats--;
-            lseek(fd, -(off_t)sizeof(Course), SEEK_CUR);
-            write(fd, &targetCourse, sizeof(Course));
+            if (lseek(fd, -(off_t)sizeof(Course), SEEK_CUR) == (off_t)-1) {
+                unlockFile(fd);
+                close(fd);
+                pthread_mutex_unlock(&enrollment_mutex);
+                sendToClient(client_fd, "Error: Failed to update course.\n");
+                return;
+            }
+            if (write(fd, &targetCourse, sizeof(Course)) != sizeof(Course)) {
+                unlockFile(fd);
+                close(fd);
+                pthread_mutex_unlock(&enrollment_mutex);
+                sendToClient(client_fd, "Error: Failed to update course.\n");
+                return;
+            }
             found = 1;
             break;
         }
@@ -470,6 +532,7 @@ void handleEnrollCourse(int client_fd, int student_id) {
     close(fd);
 
     if (!found) {
+        pthread_mutex_unlock(&enrollment_mutex);
         sendToClient(client_fd, "Error: Course not found or not active.\n");
         return;
     }
@@ -480,15 +543,23 @@ void handleEnrollCourse(int client_fd, int student_id) {
 
     fd = open(ENROLLMENTS_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd < 0) {
+        pthread_mutex_unlock(&enrollment_mutex);
         sendToClient(client_fd, "Error: Could not open enrollments file.\n");
         return;
     }
 
     lockFile(fd, F_WRLCK);
-    write(fd, &en, sizeof(Enrollment));
+    if (write(fd, &en, sizeof(Enrollment)) != sizeof(Enrollment)) {
+        unlockFile(fd);
+        close(fd);
+        pthread_mutex_unlock(&enrollment_mutex);
+        sendToClient(client_fd, "Error: Failed to write enrollment record.\n");
+        return;
+    }
     unlockFile(fd);
     close(fd);
 
+    pthread_mutex_unlock(&enrollment_mutex);
     sendToClient(client_fd, "Successfully enrolled in the course.\n");
 }
 
@@ -505,9 +576,12 @@ void handleUnenrollCourse(int client_fd, int student_id) {
 
     lockFile(fd, F_RDLCK);
     Enrollment en;
-    char response[4096] = "\n=== Your Enrolled Courses ===\n";
-    char temp[256];
+    char response[4096];
     int count = 0;
+    size_t used = 0;
+
+    used += snprintf(response + used, sizeof(response) - used,
+                     "\n=== Your Enrolled Courses ===\n");
 
     while (read(fd, &en, sizeof(Enrollment)) == sizeof(Enrollment)) {
         if (en.student_id == student_id) {
@@ -517,9 +591,11 @@ void handleUnenrollCourse(int client_fd, int student_id) {
                 lockFile(cfd, F_RDLCK);
                 while (read(cfd, &course, sizeof(Course)) == sizeof(Course)) {
                     if (course.id == en.course_id) {
-                        snprintf(temp, sizeof(temp), "Course ID: %d | Name: %s\n",
-                                course.id, course.name);
-                        strcat(response, temp);
+                        if (used < sizeof(response)) {
+                            used += snprintf(response + used, sizeof(response) - used,
+                                             "Course ID: %d | Name: %s\n",
+                                             course.id, course.name);
+                        }
                         count++;
                         break;
                     }
@@ -537,15 +613,21 @@ void handleUnenrollCourse(int client_fd, int student_id) {
         return;
     }
 
-    strcat(response, "=============================\n");
+    if (used < sizeof(response)) {
+        used += snprintf(response + used, sizeof(response) - used,
+                         "=============================\n");
+    }
     sendToClient(client_fd, response);
 
     sendToClient(client_fd, "Enter Course ID to unenroll: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     course_id = atoi(buffer);
 
+    pthread_mutex_lock(&enrollment_mutex);
+
     fd = open(ENROLLMENTS_FILE, O_RDONLY);
     if (fd < 0) {
+        pthread_mutex_unlock(&enrollment_mutex);
         sendToClient(client_fd, "Error: Could not open enrollments file.\n");
         return;
     }
@@ -553,6 +635,7 @@ void handleUnenrollCourse(int client_fd, int student_id) {
     int temp_fd = open("data/enrollments.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (temp_fd < 0) {
         close(fd);
+        pthread_mutex_unlock(&enrollment_mutex);
         sendToClient(client_fd, "Error: Could not create temp file.\n");
         return;
     }
@@ -571,8 +654,14 @@ void handleUnenrollCourse(int client_fd, int student_id) {
                 while (read(cfd, &c, sizeof(Course)) == sizeof(Course)) {
                     if (c.id == course_id) {
                         c.max_seats++;
-                        lseek(cfd, -(off_t)sizeof(Course), SEEK_CUR);
-                        write(cfd, &c, sizeof(Course));
+                        if (lseek(cfd, -(off_t)sizeof(Course), SEEK_CUR) == (off_t)-1) {
+                            perror("lseek failed");
+                            break;
+                        }
+                        if (write(cfd, &c, sizeof(Course)) != sizeof(Course)) {
+                            perror("Failed to update course seats");
+                            break;
+                        }
                         break;
                     }
                 }
@@ -580,7 +669,9 @@ void handleUnenrollCourse(int client_fd, int student_id) {
                 close(cfd);
             }
         } else {
-            write(temp_fd, &en, sizeof(Enrollment));
+            if (write(temp_fd, &en, sizeof(Enrollment)) != sizeof(Enrollment)) {
+                perror("Failed to write enrollment to temp file");
+            }
         }
     }
 
@@ -591,6 +682,8 @@ void handleUnenrollCourse(int client_fd, int student_id) {
 
     remove(ENROLLMENTS_FILE);
     rename("data/enrollments.tmp", ENROLLMENTS_FILE);
+
+    pthread_mutex_unlock(&enrollment_mutex);
 
     if (found) {
         sendToClient(client_fd, "Successfully unenrolled from the course.\n");
@@ -608,9 +701,12 @@ void handleViewEnrollments(int client_fd, int student_id) {
 
     lockFile(fd, F_RDLCK);
     Enrollment en;
-    char response[4096] = "\n=== Your Enrolled Courses ===\n";
-    char temp[256];
+    char response[4096];
     int count = 0;
+    size_t used = 0;
+
+    used += snprintf(response + used, sizeof(response) - used,
+                     "\n=== Your Enrolled Courses ===\n");
 
     while (read(fd, &en, sizeof(Enrollment)) == sizeof(Enrollment)) {
         if (en.student_id == student_id) {
@@ -620,9 +716,11 @@ void handleViewEnrollments(int client_fd, int student_id) {
                 lockFile(cfd, F_RDLCK);
                 while (read(cfd, &course, sizeof(Course)) == sizeof(Course)) {
                     if (course.id == en.course_id) {
-                        snprintf(temp, sizeof(temp), "Course ID: %d | Name: %s\n",
-                                course.id, course.name);
-                        strcat(response, temp);
+                        if (used < sizeof(response)) {
+                            used += snprintf(response + used, sizeof(response) - used,
+                                             "Course ID: %d | Name: %s\n",
+                                             course.id, course.name);
+                        }
                         count++;
                         break;
                     }
@@ -639,7 +737,10 @@ void handleViewEnrollments(int client_fd, int student_id) {
     if (count == 0) {
         sendToClient(client_fd, "No enrollments found.\n");
     } else {
-        strcat(response, "=============================\n");
+        if (used < sizeof(response)) {
+            snprintf(response + used, sizeof(response) - used,
+                     "=============================\n");
+        }
         sendToClient(client_fd, response);
     }
 }
@@ -651,6 +752,7 @@ void handleChangePassword(int client_fd, int user_id, const char *role) {
     sendToClient(client_fd, "Enter new Password: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(newPass, buffer, sizeof(newPass)-1);
+    newPass[sizeof(newPass) - 1] = '\0';
 
     if (strcmp(role, "student") == 0) {
         int fd = open(STUDENTS_FILE, O_RDWR);
@@ -666,8 +768,15 @@ void handleChangePassword(int client_fd, int user_id, const char *role) {
         while (read(fd, &stu, sizeof(Student)) == sizeof(Student)) {
             if (stu.id == user_id) {
                 strncpy(stu.password, newPass, sizeof(stu.password)-1);
-                lseek(fd, -(off_t)sizeof(Student), SEEK_CUR);
-                write(fd, &stu, sizeof(Student));
+                stu.password[sizeof(stu.password) - 1] = '\0';
+                if (lseek(fd, -(off_t)sizeof(Student), SEEK_CUR) == (off_t)-1) {
+                    perror("lseek failed");
+                    break;
+                }
+                if (write(fd, &stu, sizeof(Student)) != sizeof(Student)) {
+                    perror("Failed to update password");
+                    break;
+                }
                 found = 1;
                 break;
             }
@@ -695,8 +804,15 @@ void handleChangePassword(int client_fd, int user_id, const char *role) {
         while (read(fd, &fac, sizeof(Faculty)) == sizeof(Faculty)) {
             if (fac.id == user_id) {
                 strncpy(fac.password, newPass, sizeof(fac.password)-1);
-                lseek(fd, -(off_t)sizeof(Faculty), SEEK_CUR);
-                write(fd, &fac, sizeof(Faculty));
+                fac.password[sizeof(fac.password) - 1] = '\0';
+                if (lseek(fd, -(off_t)sizeof(Faculty), SEEK_CUR) == (off_t)-1) {
+                    perror("lseek failed");
+                    break;
+                }
+                if (write(fd, &fac, sizeof(Faculty)) != sizeof(Faculty)) {
+                    perror("Failed to update password");
+                    break;
+                }
                 found = 1;
                 break;
             }
@@ -725,6 +841,7 @@ void handleAddCourse(int client_fd, int faculty_id) {
     sendToClient(client_fd, "Enter Course Name: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
     strncpy(course.name, buffer, sizeof(course.name)-1);
+    course.name[sizeof(course.name) - 1] = '\0';
 
     sendToClient(client_fd, "Enter Max Seats: ");
     readFromClient(client_fd, buffer, BUFFER_SIZE);
@@ -756,7 +873,12 @@ void handleAddCourse(int client_fd, int faculty_id) {
     }
 
     lockFile(fd, F_WRLCK);
-    write(fd, &course, sizeof(Course));
+    if (write(fd, &course, sizeof(Course)) != sizeof(Course)) {
+        unlockFile(fd);
+        close(fd);
+        sendToClient(client_fd, "Error: Failed to add course record.\n");
+        return;
+    }
     unlockFile(fd);
     close(fd);
 
@@ -775,15 +897,20 @@ void handleRemoveCourse(int client_fd, int faculty_id) {
 
     lockFile(fd, F_RDLCK);
     Course course;
-    char response[4096] = "\n=== Your Courses ===\n";
-    char temp[256];
+    char response[4096];
     int count = 0;
+    size_t used = 0;
+
+    used += snprintf(response + used, sizeof(response) - used,
+                     "\n=== Your Courses ===\n");
 
     while (read(fd, &course, sizeof(Course)) == sizeof(Course)) {
         if (course.faculty_id == faculty_id && course.active) {
-            snprintf(temp, sizeof(temp), "ID: %d | Name: %s | Seats: %d\n",
-                    course.id, course.name, course.max_seats);
-            strcat(response, temp);
+            if (used < sizeof(response)) {
+                used += snprintf(response + used, sizeof(response) - used,
+                                 "ID: %d | Name: %s | Seats: %d\n",
+                                 course.id, course.name, course.max_seats);
+            }
             count++;
         }
     }
@@ -795,7 +922,10 @@ void handleRemoveCourse(int client_fd, int faculty_id) {
         return;
     }
 
-    strcat(response, "====================\n");
+    if (used < sizeof(response)) {
+        snprintf(response + used, sizeof(response) - used,
+                 "====================\n");
+    }
     sendToClient(client_fd, response);
 
     sendToClient(client_fd, "Enter Course ID to remove: ");
@@ -815,8 +945,14 @@ void handleRemoveCourse(int client_fd, int faculty_id) {
     while (read(fd, &targetCourse, sizeof(Course)) == sizeof(Course)) {
         if (targetCourse.id == course_id && targetCourse.faculty_id == faculty_id) {
             targetCourse.active = 0;
-            lseek(fd, -(off_t)sizeof(Course), SEEK_CUR);
-            write(fd, &targetCourse, sizeof(Course));
+            if (lseek(fd, -(off_t)sizeof(Course), SEEK_CUR) == (off_t)-1) {
+                perror("lseek failed");
+                break;
+            }
+            if (write(fd, &targetCourse, sizeof(Course)) != sizeof(Course)) {
+                perror("Failed to update course");
+                break;
+            }
             found = 1;
             break;
         }
@@ -841,9 +977,12 @@ void handleViewCourseEnrollments(int client_fd, int faculty_id) {
 
     lockFile(fd, F_RDLCK);
     Course course;
-    char response[8192] = "\n=== Course Enrollments ===\n";
-    char temp[512];
+    char response[8192];
     int found = 0;
+    size_t used = 0;
+
+    used += snprintf(response + used, sizeof(response) - used,
+                     "\n=== Course Enrollments ===\n");
 
     while (read(fd, &course, sizeof(Course)) == sizeof(Course)) {
         if (course.faculty_id == faculty_id && course.active) {
@@ -862,9 +1001,11 @@ void handleViewCourseEnrollments(int client_fd, int faculty_id) {
                 close(efd);
             }
 
-            snprintf(temp, sizeof(temp), "Course: %s (ID: %d) - Enrolled: %d/%d\n",
-                    course.name, course.id, enrollCount, enrollCount + course.max_seats);
-            strcat(response, temp);
+            if (used < sizeof(response)) {
+                used += snprintf(response + used, sizeof(response) - used,
+                                 "Course: %s (ID: %d) - Enrolled: %d/%d\n",
+                                 course.name, course.id, enrollCount, enrollCount + course.max_seats);
+            }
             found = 1;
         }
     }
@@ -874,7 +1015,10 @@ void handleViewCourseEnrollments(int client_fd, int faculty_id) {
     if (!found) {
         sendToClient(client_fd, "No courses found.\n");
     } else {
-        strcat(response, "==========================\n");
+        if (used < sizeof(response)) {
+            snprintf(response + used, sizeof(response) - used,
+                     "==========================\n");
+        }
         sendToClient(client_fd, response);
     }
 }
@@ -968,7 +1112,7 @@ void* handleClient(void *arg) {
 
     char username[100], password[50];
     int user_id;
-    char *role;
+    char role[20];
 
     sendToClient(client_fd, "===== Welcome to Academia - Course Registration Portal =====\n");
 
@@ -980,9 +1124,7 @@ void* handleClient(void *arg) {
         sendToClient(client_fd, "Password: ");
         readFromClient(client_fd, password, sizeof(password));
 
-        role = authenticate(username, password, &user_id);
-
-        if (role == NULL) {
+        if (!authenticate(username, password, &user_id, role)) {
             sendToClient(client_fd, "Invalid credentials. Please try again.\n");
             continue;
         }
